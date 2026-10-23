@@ -1,0 +1,21 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "rooms": {
+      "$room": {
+        ".read": "auth != null && $room.matches(/^[A-Za-z0-9_-]{24}$/)",
+        "state": {
+          ".write": "auth != null && $room.matches(/^[A-Za-z0-9_-]{24}$/) && newData.exists()",
+          ".validate": "newData.hasChildren(['iv', 'data']) && newData.child('iv').isString() && newData.child('iv').val().length <= 32 && newData.child('data').isString() && newData.child('data').val().length <= 6000"
+        },
+        "chat": {
+          "$message": {
+            ".write": "auth != null && !data.exists() && newData.exists()",
+            ".validate": "newData.hasChildren(['iv', 'data']) && newData.child('iv').isString() && newData.child('iv').val().length <= 32 && newData.child('data').isString() && newData.child('data').val().length <= 2400"
+          }
+        }
+      }
+    }
+  }
+}
