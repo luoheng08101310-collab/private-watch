@@ -1,5 +1,4 @@
-// 在 Firebase 控制台 -> 项目设置 -> 你的应用(Web) 获取这组配置。
-// 这组公开客户端配置不是加密密钥；真正的房间密钥仅在浏览器生成。
+// Firebase Web 配置。它不是房间解密密钥。
 export const firebaseConfig = {
   apiKey: "AIzaSyDHkZHAfyNs2uvqFNpJtJmrC9HbrmNLBQs",
   authDomain: "private-watch-c2ff2.firebaseapp.com",
@@ -10,4 +9,3 @@ export const firebaseConfig = {
   appId: "1:623295060187:web:e1f8786411671de46214fe",
   measurementId: "G-TSMVW5S3WV"
 };
-
