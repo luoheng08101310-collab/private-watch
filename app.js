@@ -2,9 +2,7 @@
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.10.0/firebase-app.js';
 import { getAuth, signInAnonymously } from 'https://www.gstatic.com/firebasejs/11.10.0/firebase-auth.js';
 import {
-  getDatabase, ref, set, onValue, push,
-  query, limitToLast, onChildAdded,
-  forceLongPolling
+  getDatabase, ref, onValue, query, limitToLast, onChildAdded, forceLongPolling
 } from 'https://www.gstatic.com/firebasejs/11.10.0/firebase-database.js';
 import { firebaseConfig } from './firebase-config.js';
 
@@ -28,7 +26,7 @@ const unb64 = str => {
 
 const random = size => crypto.getRandomValues(new Uint8Array(size));
 
-let db, roomId, key, uid;
+let db, roomId, key, uid, auth;
 let unsubscribe = null;
 let latest = null;
 let suppress = 0;
@@ -263,60 +261,72 @@ async function openSeal(envelope) {
   return JSON.parse(decoder.decode(bytes));
 }
 
-
 async function init() {
-  if (!firebaseConfig?.apiKey ||
-      firebaseConfig.apiKey === 'REPLACE_ME') {
-    throw new Error('Firebase 尚未配置');
+  if (!firebaseConfig?.apiKey || firebaseConfig.apiKey === 'REPLACE_ME') {
+    throw Error('Firebase 尚未配置，请检查 firebase-config.js。');
+  }
+  if (!firebaseConfig.databaseURL) {
+    throw Error('firebase-config.js 缺少 databaseURL。');
   }
 
   if (!db) {
     const app = initializeApp(firebaseConfig);
-    const auth = getAuth(app);
-
+    auth = getAuth(app);
     const result = await signInAnonymously(auth);
     uid = result.user.uid;
 
-    // 禁用 WebSocket，改用 HTTP 长轮询
+    // 必须在初始化 Realtime Database 实例前设置长轮询。
     forceLongPolling();
-
     db = getDatabase(app, firebaseConfig.databaseURL);
-
-    console.log('Firebase 初始化完成，UID:', uid);
   }
 }
 
-
 const roomPath = () => `rooms/${roomId}`;
 
+// 通过 Firebase REST API 写入，并显示真实 HTTP 错误，不再用 Promise.race
+// 把权限拒绝、404、网络失败等问题统一伪装成“超时”。
+async function databaseRequest(path, method, data) {
+  if (!auth?.currentUser) throw new Error('尚未完成 Firebase 匿名登录。');
+  const token = await auth.currentUser.getIdToken();
+  const base = firebaseConfig.databaseURL.replace(/\/$/, '');
+  const url = `${base}/${path}.json?auth=${encodeURIComponent(token)}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 12000);
+
+  try {
+    const response = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: data === undefined ? undefined : JSON.stringify(data),
+      signal: controller.signal,
+      cache: 'no-store'
+    });
+    const body = await response.text();
+    if (!response.ok) {
+      let detail = body;
+      try { detail = JSON.parse(body).error || body; } catch {}
+      throw new Error(`Firebase HTTP ${response.status}: ${String(detail).slice(0, 300)}`);
+    }
+    if (!body) return null;
+    try { return JSON.parse(body); } catch { return body; }
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error('Firebase REST 请求超过 12 秒仍未响应。请检查网络、数据库 URL 和 Firebase 控制台状态。');
+    }
+    if (error instanceof TypeError) {
+      throw new Error('浏览器无法访问 Firebase REST 地址，可能是网络、DNS、CSP 或浏览器插件拦截。');
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function sendState({url, position, playing}) {
-  if (!db) {
-    throw new Error('Firebase 数据库尚未初始化');
-  }
-
-  const state = {
-    url,
-    position,
-    playing,
-    at: Date.now(),
-    by: uid
-  };
-
+  if (!db) throw new Error('Firebase 数据库尚未初始化');
+  const state = { url, position, playing, at: Date.now(), by: uid };
   const encrypted = await seal(state);
-
-  const timeout = new Promise((_, reject) => {
-    setTimeout(() => {
-      reject(new Error(
-        '数据库写入超时：Firebase 可能没有连接成功。请确认 Realtime Database 安全规则已经发布，且网络允许访问 Firebase。'
-      ));
-    }, 10000);
-  });
-
-  await Promise.race([
-    set(ref(db, `${roomPath()}/state`), encrypted),
-    timeout
-  ]);
+  await databaseRequest(`${roomPath()}/state`, 'PUT', encrypted);
 }
 
 
@@ -679,8 +689,9 @@ $('chatForm').addEventListener('submit', async e => {
   input.value = '';
 
   try {
-    await push(
-      ref(db, `${roomPath()}/chat`),
+    await databaseRequest(
+      `${roomPath()}/chat`,
+      'POST',
       await seal({ by: uid, text, at: Date.now() })
     );
   } catch (err) {
