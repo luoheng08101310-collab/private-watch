@@ -1,4 +1,3 @@
-
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.10.0/firebase-app.js';
 import { getAuth, signInAnonymously } from 'https://www.gstatic.com/firebasejs/11.10.0/firebase-auth.js';
 import {
@@ -262,11 +261,8 @@ async function openSeal(envelope) {
 }
 
 async function init() {
-  if (!firebaseConfig?.apiKey || firebaseConfig.apiKey === 'REPLACE_ME') {
-    throw Error('Firebase 尚未配置，请检查 firebase-config.js。');
-  }
-  if (!firebaseConfig.databaseURL) {
-    throw Error('firebase-config.js 缺少 databaseURL。');
+  if (!firebaseConfig?.apiKey || !firebaseConfig?.databaseURL) {
+    throw new Error('Firebase 配置不完整');
   }
 
   if (!db) {
@@ -274,8 +270,6 @@ async function init() {
     auth = getAuth(app);
     const result = await signInAnonymously(auth);
     uid = result.user.uid;
-
-    // 必须在初始化 Realtime Database 实例前设置长轮询。
     forceLongPolling();
     db = getDatabase(app, firebaseConfig.databaseURL);
   }
@@ -283,13 +277,17 @@ async function init() {
 
 const roomPath = () => `rooms/${roomId}`;
 
-// 通过 Firebase REST API 写入，并显示真实 HTTP 错误，不再用 Promise.race
-// 把权限拒绝、404、网络失败等问题统一伪装成“超时”。
-async function databaseRequest(path, method, data) {
-  if (!auth?.currentUser) throw new Error('尚未完成 Firebase 匿名登录。');
+// 使用 REST API 读写数据库，避免依赖实时长连接。
+async function databaseRequest(path, method = 'GET', data) {
+  if (!auth?.currentUser) {
+    throw new Error('匿名登录尚未完成');
+  }
+
   const token = await auth.currentUser.getIdToken();
   const base = firebaseConfig.databaseURL.replace(/\/$/, '');
-  const url = `${base}/${path}.json?auth=${encodeURIComponent(token)}`;
+  const url =
+    `${base}/${path}.json?auth=${encodeURIComponent(token)}`;
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 12000);
 
@@ -301,36 +299,46 @@ async function databaseRequest(path, method, data) {
       signal: controller.signal,
       cache: 'no-store'
     });
+
     const body = await response.text();
+
     if (!response.ok) {
       let detail = body;
-      try { detail = JSON.parse(body).error || body; } catch {}
-      throw new Error(`Firebase HTTP ${response.status}: ${String(detail).slice(0, 300)}`);
+      try {
+        detail = JSON.parse(body).error || body;
+      } catch {}
+
+      throw new Error(
+        `HTTP ${response.status}: ${String(detail).slice(0, 250)}`
+      );
     }
-    if (!body) return null;
-    try { return JSON.parse(body); } catch { return body; }
-  } catch (error) {
-    if (error.name === 'AbortError') {
-      throw new Error('Firebase REST 请求超过 12 秒仍未响应。请检查网络、数据库 URL 和 Firebase 控制台状态。');
+
+    return body ? JSON.parse(body) : null;
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      throw new Error('Firebase REST 网络请求超时');
     }
-    if (error instanceof TypeError) {
-      throw new Error('浏览器无法访问 Firebase REST 地址，可能是网络、DNS、CSP 或浏览器插件拦截。');
-    }
-    throw error;
+    throw e;
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function sendState({url, position, playing}) {
-  if (!db) throw new Error('Firebase 数据库尚未初始化');
-  const state = { url, position, playing, at: Date.now(), by: uid };
-  const encrypted = await seal(state);
-  await databaseRequest(`${roomPath()}/state`, 'PUT', encrypted);
+async function sendState({ url, position, playing }) {
+  const state = {
+    url,
+    position,
+    playing,
+    at: Date.now(),
+    by: uid
+  };
+
+  await databaseRequest(
+    `${roomPath()}/state`,
+    'PUT',
+    await seal(state)
+  );
 }
-
-
-
 
 async function create() {
   clearAlert();
@@ -350,7 +358,8 @@ async function create() {
   const withTimeout = (promise, ms, message) =>
     new Promise((resolve, reject) => {
       const timer = setTimeout(
-        () => reject(new Error(message)), ms
+        () => reject(new Error(message)),
+        ms
       );
 
       Promise.resolve(promise).then(
@@ -396,7 +405,7 @@ async function create() {
 
     await withTimeout(
       sendState({
-        url: url,
+        url,
         position: 0,
         playing: false
       }),
@@ -419,7 +428,6 @@ async function create() {
     );
 
     enter();
-
   } catch (e) {
     console.error('创建房间失败：', stage, e);
 
@@ -427,13 +435,11 @@ async function create() {
       stage + '失败：' +
       (e.message || String(e))
     );
-
   } finally {
     btn.disabled = false;
     btn.textContent = '创建加密房间 →';
   }
 }
-
 
 async function join() {
   clearAlert();
@@ -445,12 +451,19 @@ async function join() {
 
     const secret = unb64(params.get('key') || '');
 
-    if (!/^[A-Za-z0-9_-]{24}$/.test(roomId || '') || secret.length !== 32) {
+    if (
+      !/^[A-Za-z0-9_-]{24}$/.test(roomId || '') ||
+      secret.length !== 32
+    ) {
       throw Error('邀请链接格式不正确，请使用完整邀请链接。');
     }
 
     key = await crypto.subtle.importKey(
-      'raw', secret, 'AES-GCM', false, ['encrypt', 'decrypt']
+      'raw',
+      secret,
+      'AES-GCM',
+      false,
+      ['encrypt', 'decrypt']
     );
 
     await init();
@@ -462,104 +475,151 @@ async function join() {
   }
 }
 
+let pollTimer = null;
+let polling = false;
+let stateSeen = false;
+let lastStateSignature = '';
+let pollFailureCount = 0;
+
+async function applyRoomState(envelope) {
+  if (!envelope) {
+    $('status').textContent = '房间状态尚不存在';
+    return;
+  }
+
+  const signature = `${envelope.iv}:${envelope.data}`;
+  if (signature === lastStateSignature) return;
+
+  const state = await openSeal(envelope);
+
+  if (
+    !validVideo(state.url) ||
+    !Number.isFinite(state.position) ||
+    state.position < 0 ||
+    typeof state.playing !== 'boolean'
+  ) {
+    throw new Error('收到的房间数据格式不正确');
+  }
+
+  lastStateSignature = signature;
+  latest = state;
+  pauseInputEvents();
+
+  await useSource(state.url);
+
+  const video = $('video');
+
+  if (currentKind === 'file' || currentKind === 'hls') {
+    const target = state.position +
+      (state.playing
+        ? Math.max(0, (Date.now() - state.at) / 1000)
+        : 0);
+
+    if (Math.abs(video.currentTime - target) > 1.5) {
+      try {
+        video.currentTime = target;
+      } catch {}
+    }
+
+    if (state.playing && video.paused) {
+      try {
+        await video.play();
+      } catch {
+        $('tapTip').classList.remove('hidden');
+      }
+    } else if (!state.playing && !video.paused) {
+      video.pause();
+    }
+  }
+
+  $('sharedTime').textContent =
+    '房间共享时间点：' + timeFormat(state.position) +
+    (state.playing ? ' · 播放参考' : ' · 暂停参考');
+
+  $('status').textContent = '加密同步已开启';
+  stateSeen = true;
+}
+
+async function receiveMessages() {
+  const data = await databaseRequest(`${roomPath()}/chat`, 'GET');
+
+  if (!data || typeof data !== 'object') return;
+
+  for (const [id, envelope] of Object.entries(data).slice(-80)) {
+    if (seen.has(id)) continue;
+
+    seen.add(id);
+
+    try {
+      const m = await openSeal(envelope);
+
+      if (typeof m.text !== 'string') continue;
+
+      const div = document.createElement('div');
+      div.className = 'message' + (m.by === uid ? ' mine' : '');
+
+      const title = document.createElement('small');
+      title.textContent = m.by === uid ? '我' : '朋友';
+
+      const message = document.createElement('span');
+      message.textContent = m.text.slice(0, 500);
+
+      div.append(title, message);
+      $('chatLog').append(div);
+    } catch (e) {
+      console.warn('跳过一条无法解密的消息', e);
+    }
+  }
+
+  $('chatLog').scrollTop = $('chatLog').scrollHeight;
+}
+
+async function pollRoom() {
+  if (polling) return;
+
+  polling = true;
+
+  try {
+    const state = await databaseRequest(
+      `${roomPath()}/state`,
+      'GET'
+    );
+
+    await applyRoomState(state);
+    pollFailureCount = 0;
+
+    try {
+      await receiveMessages();
+    } catch (e) {
+      console.warn('聊天轮询失败：', e);
+    }
+  } catch (e) {
+    pollFailureCount++;
+    $('status').textContent = '同步暂时中断，正在重试';
+
+    if (pollFailureCount === 1 || pollFailureCount % 5 === 0) {
+      announce('房间读取失败：' + (e.message || String(e)));
+    }
+  } finally {
+    polling = false;
+  }
+}
+
 function enter() {
   $('setup').classList.add('hidden');
   $('room').classList.remove('hidden');
   $('roomShort').textContent = roomId.slice(0, 6).toUpperCase();
-  $('status').textContent = '已连接，等待房间状态';
+  $('status').textContent = '正在读取房间状态…';
 
-  const video = $('video');
-
-  unsubscribe?.();
-
-  unsubscribe = onValue(
-    ref(db, `${roomPath()}/state`),
-    async snapshot => {
-      if (!snapshot.exists()) {
-        $('status').textContent = '房间不存在或尚未写入状态';
-        return;
-      }
-
-      try {
-        const state = await openSeal(snapshot.val());
-
-        if (
-          !validVideo(state.url) ||
-          typeof state.position !== 'number' ||
-          typeof state.playing !== 'boolean' ||
-          !Number.isFinite(state.position) ||
-          state.position < 0 || state.position > 1e9
-        ) throw Error('无效房间状态');
-
-        latest = state;
-        pauseInputEvents();
-
-        await useSource(state.url);
-
-        if (currentKind === 'file' || currentKind === 'hls') {
-          const target = state.position +
-            (state.playing ? Math.max(0, (Date.now() - state.at) / 1000) : 0);
-
-          if (Math.abs(video.currentTime - target) > 1.5) {
-            try { video.currentTime = target; } catch {}
-          }
-
-          if (state.playing && video.paused) {
-            try {
-              await video.play();
-              $('tapTip').classList.add('hidden');
-            } catch {
-              $('tapTip').classList.remove('hidden');
-            }
-          } else if (!state.playing && !video.paused) {
-            video.pause();
-          }
-        }
-
-        $('sharedTime').textContent =
-          '房间共享时间点：' + timeFormat(state.position) +
-          (state.playing ? ' · 播放参考' : ' · 暂停参考') +
-          '（外部网站需手动调整）';
-
-        $('status').textContent = '加密同步已开启';
-      } catch (e) {
-        console.error('读取房间状态失败：', e);
-        announce('无法解密房间数据，请确认使用的是完整邀请链接。');
-      }
-    },
-    error => announce('同步连接失败：' + explainError(error, '同步连接'))
-  );
-
-  onChildAdded(
-    query(ref(db, `${roomPath()}/chat`), limitToLast(80)),
-    async snap => {
-      if (seen.has(snap.key)) return;
-      seen.add(snap.key);
-
-      try {
-        const m = await openSeal(snap.val());
-        if (typeof m.text !== 'string') return;
-
-        const div = document.createElement('div');
-        div.className = 'message' + (m.by === uid ? ' mine' : '');
-
-        const title = document.createElement('small');
-        title.textContent = m.by === uid ? '我' : '朋友';
-
-        const msg = document.createElement('span');
-        msg.textContent = m.text.slice(0, 500);
-
-        div.append(title, msg);
-        $('chatLog').append(div);
-        $('chatLog').scrollTop = $('chatLog').scrollHeight;
-      } catch {
-        // 忽略无法解密的历史消息
-      }
-    },
-    error => announce('聊天连接失败：' + explainError(error, '聊天连接'))
-  );
-
+  clearInterval(pollTimer);
+  seen.clear();
+  lastStateSignature = '';
+  stateSeen = false;
+  pollFailureCount = 0;
   started = true;
+
+  pollRoom();
+  pollTimer = setInterval(pollRoom, 2500);
 }
 
 function notifyChange() {
@@ -567,7 +627,10 @@ function notifyChange() {
 
   const video = $('video');
 
-  if (!video.dataset.src || !['file', 'hls'].includes(currentKind)) return;
+  if (
+    !video.dataset.src ||
+    !['file', 'hls'].includes(currentKind)
+  ) return;
 
   sendState({
     url: video.dataset.src,
@@ -602,7 +665,9 @@ $('syncBtn').addEventListener('click', () => {
   pauseInputEvents();
 
   const target = latest.position +
-    (latest.playing ? Math.max(0, (Date.now() - latest.at) / 1000) : 0);
+    (latest.playing
+      ? Math.max(0, (Date.now() - latest.at) / 1000)
+      : 0);
 
   video.currentTime = target;
 
@@ -616,10 +681,17 @@ $('syncBtn').addEventListener('click', () => {
 $('changeBtn').addEventListener('click', async () => {
   const url = $('changeInput').value.trim();
 
-  if (!validVideo(url)) return announce('请输入 HTTPS 视频网址。');
+  if (!validVideo(url)) {
+    return announce('请输入 HTTPS 视频网址。');
+  }
 
   try {
-    await sendState({ url, position: 0, playing: false });
+    await sendState({
+      url,
+      position: 0,
+      playing: false
+    });
+
     $('changeInput').value = '';
   } catch (e) {
     announce('更换视频失败：' + explainError(e, '更换视频'));
@@ -641,6 +713,7 @@ $('sendTimeBtn').addEventListener('click', async () => {
       position: sec,
       playing: false
     });
+
     $('manualTime').value = '';
   } catch (e) {
     announce('发送时间点失败：' + explainError(e, '发送时间点'));
@@ -670,6 +743,7 @@ $('countdownBtn').addEventListener('click', () => {
 
   countdownTimer = setInterval(() => {
     left--;
+
     $('countdown').textContent = left > 0
       ? '倒计时 ' + left + ' 秒'
       : '现在同时播放！';
