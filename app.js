@@ -295,6 +295,7 @@ async function sendState({ url, position, playing }) {
 }
 
 
+
 async function create() {
   clearAlert();
 
@@ -307,14 +308,38 @@ async function create() {
   }
 
   btn.disabled = true;
-  let stage = 'Firebase 初始化';
+
+  let stage = 'Firebase 匿名登录';
+
+  const withTimeout = (promise, ms, message) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error(message)), ms
+      );
+
+      Promise.resolve(promise).then(
+        value => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        error => {
+          clearTimeout(timer);
+          reject(error);
+        }
+      );
+    });
 
   try {
     btn.textContent = '正在连接 Firebase...';
-    await init();
 
-    stage = '生成加密房间';
-    btn.textContent = '正在创建加密房间...';
+    await withTimeout(
+      init(),
+      15000,
+      '登录等待超时，请检查 Firebase Authentication'
+    );
+
+    stage = '生成加密密钥';
+    btn.textContent = '正在生成加密房间...';
 
     const newRoomId = b64(random(18));
     const secret = random(32);
@@ -331,12 +356,17 @@ async function create() {
     key = newKey;
 
     stage = '写入 Firebase 数据库';
+    btn.textContent = '正在保存房间...';
 
-    await sendState({
-      url: url,
-      position: 0,
-      playing: false
-    });
+    await withTimeout(
+      sendState({
+        url: url,
+        position: 0,
+        playing: false
+      }),
+      15000,
+      '数据库写入超时，请检查数据库规则和网络连接'
+    );
 
     const fragment = new URLSearchParams({
       room: roomId,
@@ -355,24 +385,13 @@ async function create() {
     enter();
 
   } catch (e) {
-    console.error(stage, e);
+    console.error('创建房间失败：', stage, e);
 
-    let message = e.message || String(e);
+    announce(
+      stage + '失败：' +
+      (e.message || String(e))
+    );
 
-    if (
-      e.code === 'PERMISSION_DENIED' ||
-      /permission.denied/i.test(message)
-    ) {
-      message = 'Firebase 数据库权限不足，请检查 Rules 是否已发布。';
-    } else if (e.code === 'auth/operation-not-allowed') {
-      message = 'Firebase 匿名登录未启用。';
-    } else if (e.code === 'auth/invalid-api-key') {
-      message = 'Firebase API Key 配置错误。';
-    } else if (e.code === 'auth/unauthorized-domain') {
-      message = '当前网站域名未获得 Firebase 登录授权。';
-    }
-
-    announce(stage + '失败：' + message);
   } finally {
     btn.disabled = false;
     btn.textContent = '创建加密房间 →';
