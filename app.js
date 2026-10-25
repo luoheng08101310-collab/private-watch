@@ -441,39 +441,91 @@ async function create() {
   }
 }
 
+
 async function join() {
   clearAlert();
-  $('joinBtn').disabled = true;
+
+  const btn = $('joinBtn');
+  btn.disabled = true;
+  btn.textContent = '正在加入房间...';
+
+  let stage = '读取邀请链接';
+
+  const withTimeout = (promise, ms, message) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(message)), ms);
+
+      Promise.resolve(promise).then(
+        value => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        error => {
+          clearTimeout(timer);
+          reject(error);
+        }
+      );
+    });
 
   try {
     const params = new URLSearchParams(location.hash.slice(1));
-    roomId = params.get('room');
-
-    const secret = unb64(params.get('key') || '');
+    const newRoomId = params.get('room');
+    const secretText = params.get('key');
 
     if (
-      !/^[A-Za-z0-9_-]{24}$/.test(roomId || '') ||
-      secret.length !== 32
+      !/^[A-Za-z0-9_-]{24}$/.test(newRoomId || '') ||
+      !secretText
     ) {
-      throw Error('邀请链接格式不正确，请使用完整邀请链接。');
+      throw new Error('邀请链接不完整，请重新复制完整链接。');
     }
 
-    key = await crypto.subtle.importKey(
-      'raw',
-      secret,
-      'AES-GCM',
-      false,
-      ['encrypt', 'decrypt']
+    const secret = unb64(secretText);
+
+    if (secret.length !== 32) {
+      throw new Error('房间密钥无效，请重新获取邀请链接。');
+    }
+
+    stage = '生成房间密钥';
+
+    const newKey = await withTimeout(
+      crypto.subtle.importKey(
+        'raw',
+        secret,
+        'AES-GCM',
+        false,
+        ['encrypt', 'decrypt']
+      ),
+      10000,
+      '手机浏览器生成密钥超时，请使用系统浏览器重试。'
     );
 
-    await init();
+    roomId = newRoomId;
+    key = newKey;
+
+    stage = '连接 Firebase';
+
+    await withTimeout(
+      init(),
+      15000,
+      '连接 Firebase 超时。请检查手机网络，并使用系统浏览器重新打开邀请链接。'
+    );
+
     enter();
+
   } catch (e) {
-    announce('加入失败：' + explainError(e, '加入房间'));
+    console.error('加入房间失败：', stage, e);
+
+    announce(
+      stage + '失败：' +
+      (e.message || String(e))
+    );
+
   } finally {
-    $('joinBtn').disabled = false;
+    btn.disabled = false;
+    btn.textContent = '加入私密房间 →';
   }
 }
+
 
 let pollTimer = null;
 let polling = false;
