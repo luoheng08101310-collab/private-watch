@@ -279,7 +279,12 @@ async function init() {
 
 const roomPath = () => `rooms/${roomId}`;
 
-async function sendState({ url, position, playing }) {
+
+async function sendState({url, position, playing}) {
+  if (!db) {
+    throw new Error('Firebase 数据库尚未初始化');
+  }
+
   const state = {
     url,
     position,
@@ -288,11 +293,22 @@ async function sendState({ url, position, playing }) {
     by: uid
   };
 
-  await set(
-    ref(db, `${roomPath()}/state`),
-    await seal(state)
-  );
+  const encrypted = await seal(state);
+
+  const timeout = new Promise((_, reject) => {
+    setTimeout(() => {
+      reject(new Error(
+        '数据库写入超时：Firebase 可能没有连接成功。请确认 Realtime Database 安全规则已经发布，且网络允许访问 Firebase。'
+      ));
+    }, 10000);
+  });
+
+  await Promise.race([
+    set(ref(db, `${roomPath()}/state`), encrypted),
+    timeout
+  ]);
 }
+
 
 
 
