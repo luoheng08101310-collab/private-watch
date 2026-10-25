@@ -3,7 +3,8 @@ import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.10.0/fireba
 import { getAuth, signInAnonymously } from 'https://www.gstatic.com/firebasejs/11.10.0/firebase-auth.js';
 import {
   getDatabase, ref, set, onValue, push,
-  query, limitToLast, onChildAdded
+  query, limitToLast, onChildAdded,
+  forceLongPolling
 } from 'https://www.gstatic.com/firebasejs/11.10.0/firebase-database.js';
 import { firebaseConfig } from './firebase-config.js';
 
@@ -262,20 +263,29 @@ async function openSeal(envelope) {
   return JSON.parse(decoder.decode(bytes));
 }
 
+
 async function init() {
-  if (!firebaseConfig?.apiKey || firebaseConfig.apiKey === 'REPLACE_ME') {
-    throw Error('Firebase 尚未配置，请检查 firebase-config.js。');
+  if (!firebaseConfig?.apiKey ||
+      firebaseConfig.apiKey === 'REPLACE_ME') {
+    throw new Error('Firebase 尚未配置');
   }
 
   if (!db) {
     const app = initializeApp(firebaseConfig);
     const auth = getAuth(app);
-    const result = await signInAnonymously(auth);
 
+    const result = await signInAnonymously(auth);
     uid = result.user.uid;
-    db = getDatabase(app);
+
+    // 禁用 WebSocket，改用 HTTP 长轮询
+    forceLongPolling();
+
+    db = getDatabase(app, firebaseConfig.databaseURL);
+
+    console.log('Firebase 初始化完成，UID:', uid);
   }
 }
+
 
 const roomPath = () => `rooms/${roomId}`;
 
