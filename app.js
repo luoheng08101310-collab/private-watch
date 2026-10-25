@@ -294,42 +294,46 @@ async function sendState({ url, position, playing }) {
   );
 }
 
+
 async function create() {
   clearAlert();
 
   const url = $('videoInput').value.trim();
+  const btn = $('createBtn');
 
   if (!validVideo(url)) {
-    announce('请输入完整的 HTTPS 视频网址。');
+    announce('请输入完整的 HTTPS 视频网址');
     return;
   }
 
-  const button = $('createBtn');
-  button.disabled = true;
-
-  const originalText = button.textContent;
-  let stage = '连接 Firebase';
-  let previousRoom = roomId;
-  let previousKey = key;
+  btn.disabled = true;
+  let stage = 'Firebase 初始化';
 
   try {
-    button.textContent = '正在连接 Firebase…';
+    btn.textContent = '正在连接 Firebase...';
     await init();
 
-    stage = '生成加密密钥';
-    roomId = b64(random(18));
+    stage = '生成加密房间';
+    btn.textContent = '正在创建加密房间...';
 
+    const newRoomId = b64(random(18));
     const secret = random(32);
-    key = await crypto.subtle.importKey(
-      'raw', secret, 'AES-GCM', false, ['encrypt', 'decrypt']
+
+    const newKey = await crypto.subtle.importKey(
+      'raw',
+      secret,
+      'AES-GCM',
+      false,
+      ['encrypt', 'decrypt']
     );
 
-    stage = '写入加密房间数据';
-    button.textContent = '正在创建加密房间…';
+    roomId = newRoomId;
+    key = newKey;
 
-    // 先确认数据库写入成功，再生成邀请链接。
+    stage = '写入 Firebase 数据库';
+
     await sendState({
-      url,
+      url: url,
       position: 0,
       playing: false
     });
@@ -340,20 +344,41 @@ async function create() {
     });
 
     history.replaceState(
-      null, '',
-      location.pathname + location.search + '#' + fragment.toString()
+      null,
+      '',
+      location.pathname +
+      location.search +
+      '#' +
+      fragment.toString()
     );
 
     enter();
+
   } catch (e) {
-    roomId = previousRoom;
-    key = previousKey;
-    announce('创建失败：' + explainError(e, stage));
+    console.error(stage, e);
+
+    let message = e.message || String(e);
+
+    if (
+      e.code === 'PERMISSION_DENIED' ||
+      /permission.denied/i.test(message)
+    ) {
+      message = 'Firebase 数据库权限不足，请检查 Rules 是否已发布。';
+    } else if (e.code === 'auth/operation-not-allowed') {
+      message = 'Firebase 匿名登录未启用。';
+    } else if (e.code === 'auth/invalid-api-key') {
+      message = 'Firebase API Key 配置错误。';
+    } else if (e.code === 'auth/unauthorized-domain') {
+      message = '当前网站域名未获得 Firebase 登录授权。';
+    }
+
+    announce(stage + '失败：' + message);
   } finally {
-    button.disabled = false;
-    button.textContent = originalText || '创建加密房间 →';
+    btn.disabled = false;
+    btn.textContent = '创建加密房间 →';
   }
 }
+
 
 async function join() {
   clearAlert();
